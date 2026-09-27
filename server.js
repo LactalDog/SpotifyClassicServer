@@ -289,21 +289,53 @@ app.get('/api/home/recently-played', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ============================================================================
+// ENDPOINT: SUGERENCIAS / BIBLIOTECA DE PLAYLISTS (Estilo Spotifast Sidebar)
+// ============================================================================
 app.get('/api/home/suggestions', async (req, res) => {
     try {
-        const token = await getValidPrimaryAccessToken();
-        const response = await fetch('https://api.spotify.com/v1/me/playlists?limit=20', {
-            headers: { "Authorization": `Bearer ${token}` }
+        // Intentamos usar primero el token compartido (que tiene acceso sin restricciones a playlists editoriales)
+        // y si no está vinculado, usamos el token primario como fallback.
+        let token;
+        try {
+            token = await getValidSharedAccessToken();
+        } catch (e) {
+            token = await getValidPrimaryAccessToken();
+        }
+
+        // Consultamos la biblioteca de playlists con el límite máximo permitido por página (50)
+        const response = await fetchWithRateLimitRetry('https://api.spotify.com/v1/me/playlists?limit=50', {
+            headers: { 
+                "Authorization": `Bearer ${token}`,
+                "Accept-Language": "es-AR,es;q=0.9"
+            }
         });
-        if (!response.ok) throw new Error(`API error: ${response.status}`);
+
+        if (!response.ok) {
+            throw new Error(`Error API Spotify playlists: HTTP ${response.status}`);
+        }
+
         const data = await response.json();
-        const suggestions = (data.items || []).filter(Boolean).map(item => ({
-            titulo: item.name || "Sin título", tipo: "Playlist",
-            artista: item.owner && item.owner.display_name ? item.owner.display_name : "Spotify",
-            portada: item.images && item.images.length > 0 ? item.images[0].url : "", uri: item.uri || ""
-        }));
-        res.json(suggestions.slice(0, 8));
-    } catch (err) { res.status(500).json({ error: err.message }); }
+
+        // Mapeamos los elementos extrayendo el nombre del propietario tal como lo hace Spotifast
+        const playlists = (data.items || []).filter(Boolean).map(item => {
+            const ownerDisplayName = item.owner?.display_name || item.owner?.id || "Spotify";
+            
+            return {
+                titulo: item.name || "Sin título",
+                tipo: "Playlist",
+                artista: ownerDisplayName, // "Spotify", "Joaquín", etc.
+                portada: item.images && item.images.length > 0 ? item.images[0].url : "",
+                uri: item.uri || ""
+            };
+        });
+
+        // Devolvemos la lista completa obtenida (o las primeras 20 para la cuadrícula principal)
+        res.json(playlists.slice(0, 20));
+    } catch (err) {
+        console.error("[Suggestions/Library Error]:", err.message);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.get('/api/home/made-for-you', async (req, res) => {
