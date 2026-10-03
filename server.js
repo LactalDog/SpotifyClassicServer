@@ -13,7 +13,7 @@ if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR);
 // 1. Credenciales Primarias
 const PRIMARY_CLIENT_ID = "e528b6952a33455093bc8dde5fb433a5";
 const PRIMARY_CLIENT_SECRET = "31ebe14970d5404c897632cf7e2897dc";
-const PRIMARY_REDIRECT_URI = "http://192.168.100.20:3000/callback";
+const PRIMARY_REDIRECT_URI = "http://127.0.0.1:3000/callback"; // <-- CAMBIADO A 127.0.0.1
 const PRIMARY_TOKEN_FILE = path.join(__dirname, 'spotify_session.json');
 
 // 2. Credenciales Compartidas
@@ -21,7 +21,7 @@ const SHARED_CLIENT_ID = "d420a117a32841c2b3474932e49fb54b";
 const SHARED_REDIRECT_URI = "http://127.0.0.1:8989/login";
 const SHARED_TOKEN_FILE = path.join(__dirname, 'spotify_session_shared.json');
 
-const SCOPES = 'user-top-read user-read-recently-played playlist-read-private playlist-read-collaborative user-library-read user-read-playback-state user-modify-playback-state';
+const SCOPES = 'user-top-read user-read-recently-played playlist-read-private playlist-read-collaborative user-library-read user-read-playback-state user-modify-playback-state user-follow-read';
 
 let primarySession = { accessToken: null, refreshToken: null, expiresAt: 0 };
 if (fs.existsSync(PRIMARY_TOKEN_FILE)) {
@@ -426,6 +426,107 @@ app.get('/api/home/made-for-you', async (req, res) => {
         res.json(result);
     } catch (err) {
         console.error("[Made For You Err]", err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ============================================================================
+// ENDPOINT: BIBLIOTECA COMPLETA DEL USUARIO (Enrutamiento Dual Spotifast)
+// ============================================================================
+app.get('/api/library', async (req, res) => {
+    try {
+        const primaryToken = await getValidPrimaryAccessToken();
+        let sharedToken;
+        try {
+            sharedToken = await getValidSharedAccessToken();
+        } catch (e) {
+            sharedToken = primaryToken; // Fallback si la compartida no está activa
+        }
+
+        const sharedHeaders = {
+            "Authorization": `Bearer ${sharedToken}`,
+            "Accept-Language": "es-AR,es;q=0.9"
+        };
+
+        const primaryHeaders = {
+            "Authorization": `Bearer ${primaryToken}`,
+            "Accept-Language": "es-AR,es;q=0.9"
+        };
+
+        // Helper para que si una sola categoría falla, no tumbe toda la biblioteca
+        const safeFetchJson = async (url, headers, label) => {
+            try {
+                const r = await fetchWithRateLimitRetry(url, { headers });
+                if (!r.ok) {
+                    const errTxt = await r.text();
+                    console.warn(`[Library Warn] ${label} devolvió HTTP ${r.status}: ${errTxt}`);
+                    return null;
+                }
+                return await r.json();
+            } catch (err) {
+                console.warn(`[Library Warn] Fallo de red en ${label}:`, err.message);
+                return null;
+            }
+        };
+
+        const [dataPlaylists, dataAlbums, dataArtists, dataTracks] = await Promise.all([
+            safeFetchJson('https://api.spotify.com/v1/me/playlists?limit=50', sharedHeaders, 'Playlists'),
+            safeFetchJson('https://api.spotify.com/v1/me/albums?limit=50', primaryHeaders, 'Albums'),
+            safeFetchJson('https://api.spotify.com/v1/me/following?type=artist&limit=50', primaryHeaders, 'Artists'),
+            safeFetchJson('https://api.spotify.com/v1/me/tracks?limit=50', primaryHeaders, 'LikedTracks')
+        ]);
+
+        // 1. Mapeo de Playlists (Shared Client ID)
+        const playlists = (dataPlaylists?.items || []).filter(Boolean).map(item => ({
+            titulo: item.name || "Sin título",
+            creador: item.owner?.display_name || item.owner?.id || "Spotify",
+            portada: item.images?.[0]?.url || "/Assets/MusicPreview.png",
+            uri: item.uri || ""
+        }));
+
+        // 2. Mapeo de Álbumes (Individual Client ID)
+        const albumes = (dataAlbums?.items || []).filter(item => item && item.album).map(item => {
+            const alb = item.album;
+            const releaseYear = alb.release_date ? alb.release_date.split('-')[0] : "";
+            return {
+                titulo: alb.name || "Sin título",
+                artista: (alb.artists || []).map(a => a.name).join(", ") || "Desconocido",
+                anio: releaseYear,
+                portada: alb.images?.[0]?.url || "/Assets/MusicPreview.png",
+                uri: alb.uri || ""
+            };
+        });
+
+        // 3. Mapeo de Artistas (Individual Client ID)
+        const artistas = (dataArtists?.artists?.items || []).filter(Boolean).map(art => ({
+            nombre: art.name || "Desconocido",
+            portada: art.images?.[0]?.url || "/Assets/MusicPreview.png",
+            uri: art.uri || ""
+        }));
+
+        // 4. Mapeo de Canciones "Me gusta" (Individual Client ID)
+        const cancionesMeGusta = (dataTracks?.items || []).filter(item => item && item.track).map(item => {
+            const t = item.track;
+            const artistNames = (t.artists || []).map(a => a.name).join(", ") || "Desconocido";
+            return {
+                titulo: t.name || "Sin título",
+                artista: artistNames,
+                bajada: artistNames,
+                portada: t.album?.images?.[0]?.url || "/Assets/MusicPreview.png",
+                uri: t.uri || ""
+            };
+        });
+
+        console.log(`[Library OK] Playlists: ${playlists.length} | Álbumes: ${albumes.length} | Artistas: ${artistas.length} | Likes: ${cancionesMeGusta.length}`);
+
+        res.json({
+            playlists,
+            albumes,
+            artistas,
+            cancionesMeGusta
+        });
+    } catch (err) {
+        console.error("[Library Endpoint Error]:", err.message);
         res.status(500).json({ error: err.message });
     }
 });
