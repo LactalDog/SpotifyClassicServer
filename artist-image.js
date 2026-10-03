@@ -2,6 +2,7 @@
 
 const puppeteer = require('puppeteer');
 
+const CACHE_LIMIT = 5;
 const artistMediaCache = new Map();
 let globalBrowser = null;
 
@@ -37,6 +38,9 @@ async function getArtistBackdrop(rawInput) {
 
     if (artistMediaCache.has(artistId)) {
         const cached = artistMediaCache.get(artistId);
+        // Mover al final para marcarlo como recientemente usado
+        artistMediaCache.delete(artistId);
+        artistMediaCache.set(artistId, cached);
         imprimirResultadosConsola(cached, true);
         return cached;
     }
@@ -95,6 +99,7 @@ async function getArtistBackdrop(rawInput) {
 
     const galleryUrls = [];
     let bannerUrl = fallbackBannerUrl;
+    let avatarUrl = null;
     const artistName = artistUnionData?.profile?.name || artistId;
 
     if (artistUnionData) {
@@ -116,31 +121,38 @@ async function getArtistBackdrop(rawInput) {
                 ((curr.maxWidth || curr.width || 0) > (prev.maxWidth || prev.width || 0) ? curr : prev), headerSources[0]);
             bannerUrl = bestHeader.url;
         }
-    }
 
-    const todasLasImagenes = [];
-    if (bannerUrl) {
-        todasLasImagenes.push(bannerUrl);
-    }
-    for (const url of galleryUrls) {
-        if (!todasLasImagenes.includes(url)) {
-            todasLasImagenes.push(url);
+        const avatarSources = artistUnionData.visuals?.avatarImage?.sources || [];
+        if (avatarSources.length > 0) {
+            const bestAvatar = avatarSources.reduce((prev, curr) =>
+                ((curr.width || 0) > (prev.width || 0) ? curr : prev), avatarSources[0]);
+            avatarUrl = bestAvatar.url;
         }
     }
 
-    // --- NUEVA LÓGICA DE PRIORIDAD ---
-    // 1. Prioridad: Banner Panorámico
-    // 2. Prioridad: Primera imagen de la Galería "Acerca de"
-    // 3. Ninguna imagen
+    const todasLasImagenes = [];
+    for (const url of galleryUrls) {
+        if (!todasLasImagenes.includes(url)) todasLasImagenes.push(url);
+    }
+    if (bannerUrl && !todasLasImagenes.includes(bannerUrl)) {
+        todasLasImagenes.push(bannerUrl);
+    }
+    if (avatarUrl && !todasLasImagenes.includes(avatarUrl)) {
+        todasLasImagenes.push(avatarUrl);
+    }
+
     let imagenSeleccionada = null;
     let tipoSeleccionado = 'Ninguna';
 
-    if (bannerUrl) {
-        imagenSeleccionada = bannerUrl;
-        tipoSeleccionado = 'Banner Panorámico';
-    } else if (galleryUrls.length > 0) {
+    if (galleryUrls.length > 0) {
         imagenSeleccionada = galleryUrls[0];
         tipoSeleccionado = 'Primera foto de la Galería "Acerca de"';
+    } else if (bannerUrl) {
+        imagenSeleccionada = bannerUrl;
+        tipoSeleccionado = 'Banner Panorámico';
+    } else if (avatarUrl) {
+        imagenSeleccionada = avatarUrl;
+        tipoSeleccionado = 'Foto de Perfil (Avatar)';
     }
 
     const resultado = {
@@ -150,11 +162,17 @@ async function getArtistBackdrop(rawInput) {
         tipo: tipoSeleccionado,
         banner: bannerUrl,
         galeria: galleryUrls,
+        avatar: avatarUrl,
         totalEncontradas: todasLasImagenes.length,
         todas: todasLasImagenes
     };
 
     if (imagenSeleccionada) {
+        // Si se supera el límite de 5, expulsa el más antiguo
+        if (artistMediaCache.size >= CACHE_LIMIT) {
+            const oldestKey = artistMediaCache.keys().next().value;
+            artistMediaCache.delete(oldestKey);
+        }
         artistMediaCache.set(artistId, resultado);
     }
 
@@ -169,16 +187,20 @@ function imprimirResultadosConsola(res, esCache) {
     console.log(`Artista ID:            ${res.id}`);
     console.log(`Fotos en Galería:      ${res.galeria.length}`);
     console.log(`Banner disponible:     ${res.banner ? 'Sí' : 'No'}`);
+    console.log(`Avatar disponible:     ${res.avatar ? 'Sí' : 'No'}`);
     console.log(`Total de imágenes:     ${res.totalEncontradas}`);
+    console.log(`Caché en memoria:      ${artistMediaCache.size}/${CACHE_LIMIT}`);
     console.log('----------------------------------------');
     console.log(`🎯 IMAGEN SELECCIONADA (${res.tipo}):`);
-    console.log(res.seleccionada || 'No se encontraron imágenes horizontales');
+    console.log(res.seleccionada || 'No se encontraron imágenes');
     console.log('----------------------------------------');
 
     if (res.todas.length > 0) {
         console.log('📋 Lista completa de imágenes encontradas:');
         res.todas.forEach((url, index) => {
-            const origen = url === res.banner ? 'Banner' : 'Galería';
+            let origen = 'Galería';
+            if (url === res.banner) origen = 'Banner';
+            if (url === res.avatar) origen = 'Avatar';
             console.log(`  [${index + 1}] (${origen}) ${url}`);
         });
     }
