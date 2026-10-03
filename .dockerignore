@@ -1,0 +1,6 @@
+cat << 'EOF' > .dockerignore
+node_modules
+cache
+*.m4a
+*.jpg
+EOF

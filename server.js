@@ -531,6 +531,133 @@ function verificarEIniciarAudio() {
 
 verificarEIniciarAudio();
 
+// ============================================================================
+// PARLANTE VIRTUAL SPOTIFY CONNECT (MODO ESPEJO DUMMY)
+// ============================================================================
+const VIRTUAL_DEVICE_NAME = "Windows Phone";
+let connectDaemon = null;
+let cachedDeviceId = null;
+
+function startConnectReceiver() {
+    if (isShuttingDown) return;
+
+    // Usamos /app/cache donde ya reside cache/credentials.json compatible con librespot Rust
+    connectDaemon = spawn('librespot', [
+        '--name', VIRTUAL_DEVICE_NAME,
+        '--device-type', 'smartphone',
+        '--backend', 'pipe',
+        '--device', '/dev/null',
+        '--cache', CACHE_DIR,
+        '--disable-audio-cache',
+        '--initial-volume', '100'
+    ]);
+
+    connectDaemon.stdout.on('data', (data) => {
+        console.log(`[Connect Virtual] ${data.toString().trim()}`);
+    });
+
+    connectDaemon.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        // Filtramos logs informativos rutinarios si lo deseas
+        console.log(`[Connect Info] ${msg}`);
+    });
+
+    connectDaemon.on('close', (code) => {
+        cachedDeviceId = null;
+        if (!isShuttingDown) {
+            console.log(`[Connect Virtual] Proceso cerrado (${code}). Reiniciando en 3s...`);
+            setTimeout(startConnectReceiver, 3000);
+        }
+    });
+}
+
+// Iniciar el receptor virtual Spotify Connect
+startConnectReceiver();
+
+// Busca el device_id del parlante virtual en la API de Spotify
+async function getVirtualDeviceId(token, forceRefresh = false) {
+    if (cachedDeviceId && !forceRefresh) return cachedDeviceId;
+
+    const res = await fetch('https://api.spotify.com/v1/me/player/devices', {
+        headers: { "Authorization": `Bearer ${token}` }
+    });
+
+    if (res.ok) {
+        const data = await res.json();
+        const device = (data.devices || []).find(d => d.name === VIRTUAL_DEVICE_NAME);
+        if (device && device.id) {
+            cachedDeviceId = device.id;
+            return cachedDeviceId;
+        }
+    }
+    return null;
+}
+
+// Endpoint que recibe el estado real desde el Lumia y lo refleja en Spotify Cloud
+app.post('/api/player/sync', async (req, res) => {
+    const { action, uri, positionMs } = req.query;
+
+    try {
+        const token = await getValidPrimaryAccessToken();
+        let deviceId = await getVirtualDeviceId(token, false);
+
+        if (!deviceId) {
+            // Reintento forzando refresco de lista de dispositivos
+            deviceId = await getVirtualDeviceId(token, true);
+        }
+
+        if (!deviceId) {
+            return res.status(503).json({ error: "Parlante virtual aún no disponible en Spotify Connect." });
+        }
+
+        const pos = Math.max(0, parseInt(positionMs || '0', 10));
+
+        if (action === 'play') {
+            // Si enviamos URI iniciamos esa pista en la posición indicada; si no hay URI, reanudamos
+            const bodyObj = uri ? { uris: [uri], position_ms: pos } : { position_ms: pos };
+
+            let playRes = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
+                method: 'PUT',
+                headers: {
+                    "Authorization": `Bearer ${token}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify(bodyObj)
+            });
+
+            // Si el deviceId cambió por reconexión, refrescamos una vez
+            if (playRes.status === 404) {
+                deviceId = await getVirtualDeviceId(token, true);
+                if (deviceId) {
+                    await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
+                        method: 'PUT',
+                        headers: {
+                            "Authorization": `Bearer ${token}`,
+                            "Content-Type": "application/json"
+                        },
+                        body: JSON.stringify(bodyObj)
+                    });
+                }
+            }
+        } else if (action === 'pause') {
+            await fetch(`https://api.spotify.com/v1/me/player/pause?device_id=${deviceId}`, {
+                method: 'PUT',
+                headers: { "Authorization": `Bearer ${token}` }
+            });
+        } else if (action === 'seek') {
+            await fetch(`https://api.spotify.com/v1/me/player/seek?position_ms=${pos}&device_id=${deviceId}`, {
+                method: 'PUT',
+                headers: { "Authorization": `Bearer ${token}` }
+            });
+        }
+
+        res.json({ success: true, action, positionMs: pos });
+    } catch (err) {
+        console.error("[Sync Error]:", err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Endpoint de fondo optimizado con detección de caché previa
 app.get('/api/player/backdrop', async (req, res) => {
     const trackUri = req.query.uri;
