@@ -532,38 +532,58 @@ function verificarEIniciarAudio() {
 verificarEIniciarAudio();
 
 // ============================================================================
-// PARLANTE VIRTUAL SPOTIFY CONNECT (MODO ESPEJO DUMMY)
+// PARLANTE VIRTUAL SPOTIFY CONNECT (CON RELOJ TIEMPO REAL 1X)
 // ============================================================================
 const VIRTUAL_DEVICE_NAME = "Windows Phone";
 let connectDaemon = null;
+let audioClockProc = null;
 let cachedDeviceId = null;
 
 function startConnectReceiver() {
     if (isShuttingDown) return;
 
-    // Usamos /app/cache donde ya reside cache/credentials.json compatible con librespot Rust
+    // 1. Lanzamos librespot enviando el PCM crudo (16-bit, 44.1kHz, estéreo) por stdout
     connectDaemon = spawn('librespot', [
         '--name', VIRTUAL_DEVICE_NAME,
         '--device-type', 'smartphone',
         '--backend', 'pipe',
-        '--device', '/dev/null',
         '--cache', CACHE_DIR,
         '--disable-audio-cache',
         '--initial-volume', '100'
-    ]);
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
-    connectDaemon.stdout.on('data', (data) => {
-        console.log(`[Connect Virtual] ${data.toString().trim()}`);
-    });
+    // 2. Conectamos la salida de audio de librespot a un consumidor FFmpeg en tiempo real (-re)
+    // Esto frena la tubería exactamente a 44100 Hz (velocidad 1x) para que librespot
+    // avance el segundero de Spotify Connect de forma 100% orgánica sin vaciar el buffer de golpe.
+    audioClockProc = spawn('ffmpeg', [
+        '-hide_banner',
+        '-loglevel', 'quiet',
+        '-re',
+        '-f', 's16le',
+        '-ar', '44100',
+        '-ac', '2',
+        '-i', 'pipe:0',
+        '-f', 'null',
+        '-'
+    ], { stdio: ['pipe', 'ignore', 'ignore'] });
+
+    connectDaemon.stdout.pipe(audioClockProc.stdin);
+
+    // Evitar caídas por EPIPE si se reinicia el proceso
+    audioClockProc.stdin.on('error', () => {});
+    connectDaemon.stdout.on('error', () => {});
 
     connectDaemon.stderr.on('data', (data) => {
         const msg = data.toString().trim();
-        // Filtramos logs informativos rutinarios si lo deseas
         console.log(`[Connect Info] ${msg}`);
     });
 
     connectDaemon.on('close', (code) => {
         cachedDeviceId = null;
+        if (audioClockProc) {
+            try { audioClockProc.kill('SIGKILL'); } catch (e) {}
+            audioClockProc = null;
+        }
         if (!isShuttingDown) {
             console.log(`[Connect Virtual] Proceso cerrado (${code}). Reiniciando en 3s...`);
             setTimeout(startConnectReceiver, 3000);
@@ -602,7 +622,6 @@ app.post('/api/player/sync', async (req, res) => {
         let deviceId = await getVirtualDeviceId(token, false);
 
         if (!deviceId) {
-            // Reintento forzando refresco de lista de dispositivos
             deviceId = await getVirtualDeviceId(token, true);
         }
 
@@ -611,9 +630,9 @@ app.post('/api/player/sync', async (req, res) => {
         }
 
         const pos = Math.max(0, parseInt(positionMs || '0', 10));
+        console.log(`[Sync Connect] Acción: ${action} | URI: ${uri || 'actual'} | Pos: ${pos}ms`);
 
         if (action === 'play') {
-            // Si enviamos URI iniciamos esa pista en la posición indicada; si no hay URI, reanudamos
             const bodyObj = uri ? { uris: [uri], position_ms: pos } : { position_ms: pos };
 
             let playRes = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`, {
@@ -625,7 +644,6 @@ app.post('/api/player/sync', async (req, res) => {
                 body: JSON.stringify(bodyObj)
             });
 
-            // Si el deviceId cambió por reconexión, refrescamos una vez
             if (playRes.status === 404) {
                 deviceId = await getVirtualDeviceId(token, true);
                 if (deviceId) {
