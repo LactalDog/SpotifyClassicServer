@@ -488,10 +488,20 @@ app.get('/api/library', async (req, res) => {
         const albumes = (dataAlbums?.items || []).filter(item => item && item.album).map(item => {
             const alb = item.album;
             const releaseYear = alb.release_date ? alb.release_date.split('-')[0] : "";
+            
+            let tipoTraducido = "álbum";
+            const rawType = (alb.album_type || "").toLowerCase();
+            if (rawType === "single") {
+                tipoTraducido = (alb.total_tracks && alb.total_tracks >= 4) ? "ep" : "sencillo";
+            } else if (rawType === "compilation") {
+                tipoTraducido = "recopilación";
+            }
+
             return {
                 titulo: alb.name || "Sin título",
                 artista: (alb.artists || []).map(a => a.name).join(", ") || "Desconocido",
                 anio: releaseYear,
+                tipo: tipoTraducido,
                 portada: alb.images?.[0]?.url || "/Assets/MusicPreview.png",
                 uri: alb.uri || ""
             };
@@ -527,6 +537,161 @@ app.get('/api/library', async (req, res) => {
         });
     } catch (err) {
         console.error("[Library Endpoint Error]:", err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Helper para formatear la duración total (ej: "12 canciones • 45 min" o "1 h 10 min")
+function formatearDetallesColeccion(cantidadCanciones, totalDurationMs) {
+    const totalMinutes = Math.max(1, Math.round(totalDurationMs / 60000));
+    const hours = Math.floor(totalMinutes / 60);
+    const mins = totalMinutes % 60;
+    const textoCanciones = cantidadCanciones === 1 ? "1 canción" : `${cantidadCanciones} canciones`;
+    const textoTiempo = hours > 0 ? `${hours} h ${mins} min` : `${mins} min`;
+    return `${textoCanciones} • ${textoTiempo}`;
+}
+
+// Helper para formatear mm:ss de cada pista individual
+function formatearDuracionPista(ms) {
+    if (!ms || ms <= 0) return "0:00";
+    const totalSeconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
+}
+
+// ============================================================================
+// ENDPOINT: DETALLE DE PLAYLIST Y SUS CANCIONES
+// ============================================================================
+app.get('/api/playlist/:id', async (req, res) => {
+    try {
+        const playlistId = req.params.id.split(':').pop();
+        let token;
+        try {
+            token = await getValidSharedAccessToken();
+        } catch (e) {
+            token = await getValidPrimaryAccessToken();
+        }
+
+        const response = await fetchWithRateLimitRetry(`https://api.spotify.com/v1/playlists/${playlistId}`, {
+            headers: {
+                "Authorization": `Bearer ${token}`,
+                "Accept-Language": "es-AR,es;q=0.9"
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`Error API Spotify playlist detail: HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        const ownerName = data.owner?.display_name || data.owner?.id || "Spotify";
+
+        let totalDurationMs = 0;
+        const canciones = [];
+
+        (data.tracks?.items || []).forEach((item, index) => {
+            const t = item?.track;
+            if (!t || !t.id) return; // Ignorar pistas nulas o eliminadas
+
+            const durationMs = t.duration_ms || 0;
+            totalDurationMs += durationMs;
+
+            canciones.push({
+                numero: (index + 1).toString(),
+                titulo: t.name || "Sin título",
+                artista: (t.artists || []).map(a => a.name).join(", ") || "Desconocido",
+                duracion: formatearDuracionPista(durationMs),
+                portada: t.album?.images?.[0]?.url || "/Assets/MusicPreview.png",
+                uri: t.uri || ""
+            });
+        });
+
+        const totalTracks = data.tracks?.total || canciones.length;
+
+        res.json({
+            id: data.id,
+            titulo: data.name || "Sin título",
+            creador: ownerName,
+            portada: data.images?.[0]?.url || "/Assets/MusicPreview.png",
+            detalles: formatearDetallesColeccion(totalTracks, totalDurationMs),
+            uri: data.uri || "",
+            canciones
+        });
+    } catch (err) {
+        console.error("[Playlist Detail Error]:", err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ============================================================================
+// ENDPOINT: DETALLE DE ÁLBUM Y SUS CANCIONES
+// ============================================================================
+app.get('/api/album/:id', async (req, res) => {
+    try {
+        const albumId = req.params.id.split(':').pop();
+        const token = await getValidPrimaryAccessToken();
+
+        const response = await fetchWithRateLimitRetry(`https://api.spotify.com/v1/albums/${albumId}`, {
+            headers: {
+                "Authorization": `Bearer ${token}`,
+                "Accept-Language": "es-AR,es;q=0.9"
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`Error API Spotify album detail: HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        const artistasStr = (data.artists || []).map(a => a.name).join(", ") || "Desconocido";
+        const artistaPrincipal = data.artists?.[0]?.name || artistasStr;
+        const releaseYear = data.release_date ? data.release_date.split('-')[0] : "";
+        const coverUrl = data.images?.[0]?.url || "/Assets/MusicPreview.png";
+
+        // Traducir tipo de publicación ("album", "single", "compilation")
+        let tipoTraducido = "álbum";
+        const rawType = (data.album_type || "").toLowerCase();
+        if (rawType === "single") {
+            tipoTraducido = (data.total_tracks && data.total_tracks >= 4) ? "ep" : "sencillo";
+        } else if (rawType === "compilation") {
+            tipoTraducido = "recopilación";
+        }
+
+        let totalDurationMs = 0;
+        const canciones = [];
+
+        (data.tracks?.items || []).forEach((t, index) => {
+            if (!t) return;
+            const durationMs = t.duration_ms || 0;
+            totalDurationMs += durationMs;
+
+            canciones.push({
+                numero: (t.track_number || (index + 1)).toString(),
+                titulo: t.name || "Sin título",
+                artista: (t.artists || []).map(a => a.name).join(", ") || artistasStr,
+                duracion: formatearDuracionPista(durationMs),
+                portada: coverUrl,
+                uri: t.uri || ""
+            });
+        });
+
+        const totalTracks = data.total_tracks || canciones.length;
+
+        res.json({
+            id: data.id,
+            titulo: data.name || "Sin título",
+            artista: artistasStr,
+            artistaPrincipal: artistaPrincipal,
+            anio: releaseYear,
+            tipo: tipoTraducido,
+            portada: coverUrl,
+            detalles: formatearDetallesColeccion(totalTracks, totalDurationMs),
+            uri: data.uri || "",
+            canciones
+        });
+    } catch (err) {
+        console.error("[Album Detail Error]:", err.message);
         res.status(500).json({ error: err.message });
     }
 });
